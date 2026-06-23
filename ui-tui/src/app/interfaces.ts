@@ -3,7 +3,7 @@ import type { MutableRefObject, ReactNode, RefObject, SetStateAction } from 'rea
 
 import type { PasteEvent } from '../components/textInput.js'
 import type { GatewayClient } from '../gatewayClient.js'
-import type { BillingStateResponse, ImageAttachResponse, SessionCloseResponse } from '../gatewayTypes.js'
+import type { BillingStateResponse, ImageAttachResponse, SessionCloseResponse, SubscriptionStateResponse } from '../gatewayTypes.js'
 import type { ParsedVoiceRecordKey } from '../lib/platform.js'
 import type { RpcResult } from '../lib/rpc.js'
 import type { Theme } from '../theme.js'
@@ -127,6 +127,35 @@ export interface BillingOverlayState {
   state: BillingStateResponse
 }
 
+// ── Subscription overlay (deep-link only, NEVER charges in-terminal) ──
+
+export type SubscriptionScreen =
+  | 'overview'      // shows plan + usage bar + tier list (states a–e collapse into this)
+  | 'confirm'       // y/n confirm before opening the Stripe URL
+  | 'stepup'        // Phase 4: "Allow Remote Spending" (resumable)
+  | 'handoff'       // transient: "Opening Stripe in your browser…"
+
+export interface SubscriptionOverlayCtx {
+  /** Fetch the manage-link URL and open it (deep-link). Resolves ok/false. */
+  openManageLink: (targetTierId?: string) => Promise<boolean>
+  /** Re-fetch subscription.state (used by Phase-4 resume). */
+  refreshState: () => Promise<SubscriptionStateResponse | null>
+  /** Run billing.step_up (Remote Spending). Resolves granted. */
+  requestRemoteSpending: () => Promise<boolean>
+  /** Emit a transcript system line. */
+  sys: (text: string) => void
+}
+
+export interface SubscriptionOverlayState {
+  ctx: SubscriptionOverlayCtx
+  screen: SubscriptionScreen
+  state: SubscriptionStateResponse
+  /** Phase 4 resume bookkeeping: the screen to return to after step-up. */
+  resumeScreen?: SubscriptionScreen | null
+  /** Phase 4: the pending tier the user confirmed, replayed post-grant. */
+  pendingTargetTierId?: string | null
+}
+
 export interface OverlayState {
   agents: boolean
   agentsInitialHistoryIndex: number
@@ -140,6 +169,7 @@ export interface OverlayState {
   secret: null | SecretReq
   sessions: boolean
   skillsHub: boolean
+  subscription: SubscriptionOverlayState | null
   sudo: null | SudoReq
 }
 
