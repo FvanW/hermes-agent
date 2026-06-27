@@ -2035,21 +2035,29 @@ export function ChatBar({
 
   // Hand the mic between the server-side wake detector and the browser's voice
   // loop: pause the detector while a conversation is live, resume it after
-  // (no-ops server-side when the wake word isn't armed).
+  // (no-ops server-side when the wake word isn't armed). wakePausedRef tracks
+  // whether WE paused, so resume always runs once — including on unmount, where
+  // ending voice can tear the composer down before the `false` render lands and
+  // would otherwise leave the detector paused forever (#wake-stays-off).
   const wakePausedRef = useRef(false)
-  useEffect(() => {
-    const gw = $gateway.get()
-    if (!gw) {
+  const resumeWakeIfPaused = useCallback(() => {
+    if (!wakePausedRef.current) {
       return
     }
+    wakePausedRef.current = false
+    void $gateway.get()?.request('wake.resume', {}).catch(() => undefined)
+  }, [])
+
+  useEffect(() => {
     if (voiceConversationActive) {
       wakePausedRef.current = true
-      void gw.request('wake.pause', {}).catch(() => undefined)
-    } else if (wakePausedRef.current) {
-      wakePausedRef.current = false
-      void gw.request('wake.resume', {}).catch(() => undefined)
+      void $gateway.get()?.request('wake.pause', {}).catch(() => undefined)
+    } else {
+      resumeWakeIfPaused()
     }
-  }, [voiceConversationActive])
+  }, [voiceConversationActive, resumeWakeIfPaused])
+
+  useEffect(() => resumeWakeIfPaused, [resumeWakeIfPaused])
 
   const contextMenu = (
     <ContextMenu
