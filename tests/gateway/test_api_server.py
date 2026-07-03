@@ -626,6 +626,75 @@ class TestAdapterInit:
         adapter._create_agent(session_id="a-totally-different-session-id", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
 
+    def test_create_agent_forwards_service_tier_and_request_overrides(self, monkeypatch):
+        """Codex finding #4 (HIGH): run.py reloads agent.service_tier every
+        turn (~16209) and resolves provider-appropriate request_overrides via
+        resolve_fast_mode_overrides() when set (~3610-3619), passing both
+        into AIAgent (~16443-16444). api_server.py loaded reasoning config
+        but never service tier -- Priority Processing / Anthropic Fast Mode
+        never activated even when explicitly configured."""
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {"provider": "anthropic", "base_url": "https://example.test/v1", "api_mode": "anthropic_messages"},
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "claude-sonnet-4-6")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda: {}))
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_provider_routing", staticmethod(lambda: {}))
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_service_tier", staticmethod(lambda: "priority"))
+        monkeypatch.setattr(
+            "hermes_cli.models.resolve_fast_mode_overrides",
+            lambda model_id: {"speed": "fast"} if "claude" in model_id else {"service_tier": "priority"},
+        )
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        adapter._create_agent(session_id="api-session")
+
+        assert captured["service_tier"] == "priority"
+        assert captured["request_overrides"] == {"speed": "fast"}
+
+    def test_create_agent_service_tier_off_yields_no_request_overrides(self, monkeypatch):
+        """When service_tier is unset (the live config.yaml's current
+        state), request_overrides must be an empty dict, not None or the
+        fast-mode overrides applied unconditionally."""
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {"provider": "anthropic", "base_url": "https://example.test/v1", "api_mode": "anthropic_messages"},
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "claude-sonnet-4-6")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda: {}))
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_provider_routing", staticmethod(lambda: {}))
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_service_tier", staticmethod(lambda: None))
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        adapter._create_agent(session_id="api-session")
+
+        assert captured["service_tier"] is None
+        assert captured["request_overrides"] == {}
+
 
 # ---------------------------------------------------------------------------
 # Auth checking

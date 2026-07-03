@@ -1415,6 +1415,29 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        # Priority Processing / fast-mode (config.yaml agent.service_tier).
+        # Codex finding #4, HIGH: run.py reloads this every turn (~16209) and
+        # resolves provider-appropriate request_overrides (OpenAI: {"service_tier":
+        # "priority"}, Anthropic: {"speed": "fast"}) via resolve_fast_mode_overrides()
+        # when set (~3610-3619), passing both into AIAgent (~16443-16444).
+        # api_server.py loaded reasoning config but never service tier — a
+        # request never got Priority Processing / Fast Mode even when
+        # explicitly configured. Currently inert (agent.service_tier is unset
+        # in the live config.yaml), ported for parity. run.py also refreshes
+        # service_tier/request_overrides on CACHED agent instances across
+        # turns (~16523-16524) — inapplicable here: api_server.py builds a
+        # fresh AIAgent every turn (no cross-turn agent cache), so passing
+        # the freshly-reloaded values into the constructor is already
+        # equivalent; there is no stale cached agent to refresh.
+        service_tier = GatewayRunner._load_service_tier()
+        request_overrides = {}
+        if service_tier:
+            try:
+                from hermes_cli.models import resolve_fast_mode_overrides
+                request_overrides = resolve_fast_mode_overrides(model) or {}
+            except Exception:
+                request_overrides = {}
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -1432,6 +1455,8 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
+            service_tier=service_tier,
+            request_overrides=request_overrides,
             gateway_session_key=gateway_session_key,
         )
         return agent
