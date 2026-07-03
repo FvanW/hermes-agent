@@ -131,11 +131,22 @@ async def test_run_agent_returns_controlled_response_on_provider_auth_failure(ad
     /v1/chat/completions caught it as a generic, undifferentiated
     "Internal server error: {e}" 500, and /api/sessions/{id}/chat didn't
     catch it at all (raw aiohttp 500, no JSON body). Must now return
-    run.py's exact controlled response shape instead of raising."""
-    def fake_create_agent(**kwargs):
-        raise RuntimeError("No credentials found for provider 'nous' — run `hermes auth add nous`")
+    run.py's exact controlled response shape instead of raising.
 
-    monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+    Exercises the REAL boundary (gateway.run._resolve_runtime_agent_kwargs,
+    the sole raiser of this RuntimeError) rather than mocking away
+    _create_agent() wholesale -- per Codex round-2 re-review, mocking
+    _create_agent() only validates the wrapper shape, not that
+    _create_agent() actually converts the RuntimeError into
+    _ProviderAuthResolutionError at the right call site. This is the
+    first substantive call inside _create_agent(), so no other config
+    loader needs stubbing for this failure path."""
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("No credentials found for provider 'nous' — run `hermes auth add nous`")
+        ),
+    )
 
     result, usage = await adapter._run_agent(
         user_message="hello",
@@ -154,10 +165,9 @@ async def test_run_agent_returns_controlled_response_on_provider_auth_failure(ad
 
 @pytest.mark.asyncio
 async def test_run_agent_does_not_swallow_unrelated_exceptions(adapter, monkeypatch):
-    """The RuntimeError catch must stay narrow -- a TypeError (or any other
-    non-RuntimeError bug elsewhere in _create_agent()/run_conversation())
-    must still propagate normally, not get mislabeled as a provider auth
-    failure."""
+    """The _ProviderAuthResolutionError catch must stay narrow -- a
+    TypeError elsewhere in _create_agent()/run_conversation() must still
+    propagate normally, not get mislabeled as a provider auth failure."""
     def fake_create_agent(**kwargs):
         raise TypeError("unrelated bug: unexpected keyword argument")
 
@@ -172,29 +182,58 @@ async def test_run_agent_does_not_swallow_unrelated_exceptions(adapter, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_session_chat_surfaces_controlled_response_on_provider_auth_failure(auth_adapter, session_db):
+async def test_run_agent_does_not_swallow_unrelated_runtime_error_from_run_conversation(adapter, monkeypatch):
+    """Codex round-2 re-review: this was the actual bug in the first version
+    of this fix. agent.run_conversation() can legitimately raise a
+    RuntimeError unrelated to provider auth (e.g. run_agent.py's "Failed to
+    recreate closed OpenAI client"). A bare `except RuntimeError` around the
+    whole _create_agent()+run_conversation() span would mislabel it as
+    "Provider authentication failed". Only _ProviderAuthResolutionError --
+    raised exclusively inside _create_agent() at the
+    _resolve_runtime_agent_kwargs() call site -- may trigger the controlled
+    response; this unrelated RuntimeError from run_conversation() must
+    propagate unhandled."""
+    class _FakeAgent:
+        def run_conversation(self, **kwargs):
+            raise RuntimeError("Failed to recreate closed OpenAI client")
+
+    monkeypatch.setattr(adapter, "_create_agent", lambda **kwargs: _FakeAgent())
+
+    with pytest.raises(RuntimeError, match="Failed to recreate closed OpenAI client"):
+        await adapter._run_agent(
+            user_message="hello",
+            conversation_history=[],
+            session_id="request-session",
+        )
+
+
+@pytest.mark.asyncio
+async def test_session_chat_surfaces_controlled_response_on_provider_auth_failure(auth_adapter, session_db, monkeypatch):
     """End-to-end: POST /api/sessions/{id}/chat previously had zero wrapping
     around _run_agent() -- an unhandled RuntimeError would have produced a
     raw aiohttp 500 with no JSON body. Must now return 200 with the
     controlled error message as the assistant content, matching what
     /v1/chat/completions' existing (separate) generic-500 fallback would
     have produced for other errors, but distinguishing this specific case
-    the way run.py does."""
+    the way run.py does. Exercises the real
+    gateway.run._resolve_runtime_agent_kwargs() boundary, not a mocked
+    _create_agent()."""
     session_id = session_db.create_session("auth-fail-session", "api_server")
 
-    def fake_create_agent(**kwargs):
-        raise RuntimeError("Auth failed: token expired")
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: (_ for _ in ()).throw(RuntimeError("Auth failed: token expired")),
+    )
 
     app = _create_session_app(auth_adapter)
-    with patch.object(auth_adapter, "_create_agent", fake_create_agent):
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                f"/api/sessions/{session_id}/chat",
-                json={"message": "hi"},
-                headers={"Authorization": "Bearer sk-test"},
-            )
-            assert resp.status == 200
-            payload = await resp.json()
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/chat",
+            json={"message": "hi"},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        assert resp.status == 200
+        payload = await resp.json()
 
     assert payload["message"]["content"] == "⚠️ Provider authentication failed: Auth failed: token expired"
 

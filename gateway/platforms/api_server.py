@@ -815,6 +815,23 @@ except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
 
 
+class _ProviderAuthResolutionError(RuntimeError):
+    """Raised only when gateway.run._resolve_runtime_agent_kwargs() fails
+    to resolve provider credentials (Codex finding #5, MEDIUM).
+
+    That function is the sole raiser of RuntimeError(format_runtime_
+    provider_error(...)) anywhere in _create_agent()'s call graph.
+    Re-raising it as this dedicated subclass -- instead of catching bare
+    RuntimeError around the much wider _create_agent()+run_conversation()
+    span -- lets callers distinguish "provider auth/credential failure"
+    from any other RuntimeError a provider adapter or run_conversation()
+    might legitimately raise (e.g. run_agent.py's "Failed to recreate
+    closed OpenAI client"), which a bare `except RuntimeError` there would
+    otherwise mislabel as an auth failure (Codex round-2 re-review of the
+    original fix).
+    """
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -1282,7 +1299,19 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         from hermes_cli.tools_config import _get_platform_tools
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        # Codex finding #5 (MEDIUM), round-2 correction: catch RuntimeError
+        # ONLY around this call, not the wider _create_agent()+
+        # run_conversation() span -- _resolve_runtime_agent_kwargs() is the
+        # sole raiser of RuntimeError(format_runtime_provider_error(...))
+        # (gateway/run.py:1738/1740) for provider auth/credential failure.
+        # Re-raising as _ProviderAuthResolutionError lets _run_agent() (and
+        # _handle_runs()) distinguish this from an unrelated RuntimeError
+        # elsewhere in the call graph (e.g. run_agent.py's "Failed to
+        # recreate closed OpenAI client").
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        except RuntimeError as exc:
+            raise _ProviderAuthResolutionError(str(exc)) from exc
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
 
@@ -4221,26 +4250,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 if isinstance(_eff_sid, str) and _eff_sid:
                     result["session_id"] = _eff_sid
                 return result, usage
-            except RuntimeError as exc:
-                # Codex finding #5, MEDIUM: _resolve_runtime_agent_kwargs()
-                # (called inside _create_agent()) raises RuntimeError(
-                # format_runtime_provider_error(...)) on provider auth/
-                # credential failure -- that's the ONLY thing in this
-                # function that raises RuntimeError specifically (other bugs
-                # in _create_agent()'s other logic would surface as
-                # TypeError/AttributeError/etc., not RuntimeError, so this
-                # catch is deliberately narrower than run.py's own `except
-                # Exception` around the equivalent call in
-                # _resolve_session_agent_runtime — precise enough to avoid
-                # mislabeling an unrelated bug as an auth failure, matching
-                # run.py's exact response shape (final_response text, no
-                # HTTP error) for the case it IS a real one. Previously this
-                # propagated unhandled: /v1/chat/completions caught it as a
-                # bare, undifferentiated "Internal server error: {e}" 500,
-                # and /api/sessions/{id}/chat[/stream] didn't catch it at
-                # all -- aiohttp's raw unhandled-exception 500 with no JSON
-                # body. Handling it here, once, covers every _run_agent()
-                # caller identically.
+            except _ProviderAuthResolutionError as exc:
+                # Codex finding #5, MEDIUM, round-2 correction: catching bare
+                # RuntimeError here (as the first version of this fix did)
+                # is unsafe -- agent.run_conversation() can legitimately
+                # raise unrelated RuntimeErrors (e.g. run_agent.py's "Failed
+                # to recreate closed OpenAI client", or a provider/Responses
+                # adapter's runtime error for a malformed response), which
+                # would get mislabeled as a provider auth failure. Only
+                # _ProviderAuthResolutionError -- raised exclusively where
+                # _resolve_runtime_agent_kwargs() is called inside
+                # _create_agent() -- means this specific failure. Matches
+                # run.py's response shape (final_response text, no HTTP
+                # error) for the case it IS a real auth failure. Previously
+                # this propagated unhandled: /v1/chat/completions caught it
+                # as a bare, undifferentiated "Internal server error: {e}"
+                # 500, and /api/sessions/{id}/chat[/stream] didn't catch it
+                # at all -- aiohttp's raw unhandled-exception 500 with no
+                # JSON body. Handling it here, once, covers every
+                # _run_agent() caller identically (chat_completions,
+                # session_chat, session_chat_stream, responses). /v1/runs
+                # does not call _run_agent() -- see _handle_runs()'s own
+                # _ProviderAuthResolutionError branch for that path.
                 logger.warning("Provider authentication failed for session=%s: %s",
                                 session_id or "", exc)
                 return (
@@ -4584,6 +4615,34 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
                 raise
+            except _ProviderAuthResolutionError as exc:
+                # Codex finding #5, MEDIUM: /v1/runs builds its own agent
+                # via _create_agent() and does not route through
+                # _run_agent() (see that method's own
+                # _ProviderAuthResolutionError branch), so it needs its own
+                # handling to surface the same distinguished, controlled
+                # message the other three endpoints (chat_completions,
+                # session_chat, session_chat_stream) give a provider auth/
+                # credential failure, instead of falling through to the
+                # generic except-Exception branch below and getting an
+                # undistinguished "agent run failed"-style message.
+                logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
+                error_msg = f"⚠️ Provider authentication failed: {exc}"
+                self._set_run_status(
+                    run_id,
+                    "failed",
+                    error=error_msg,
+                    last_event="run.failed",
+                )
+                try:
+                    q.put_nowait({
+                        "event": "run.failed",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "error": error_msg,
+                    })
+                except Exception:
+                    pass
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
                 self._set_run_status(
