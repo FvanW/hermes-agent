@@ -30,6 +30,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _derive_chat_session_id,
+    _ProviderAuthResolutionError,
     _redact_api_error_text,
     check_api_server_requirements,
     cors_middleware,
@@ -625,6 +626,29 @@ class TestAdapterInit:
         )
         adapter._create_agent(session_id="a-totally-different-session-id", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
+
+    def test_create_agent_wraps_runtime_credential_failure_as_provider_auth_error(self, monkeypatch):
+        """Codex finding #5 (MEDIUM), round-2 re-review: the first version of
+        this fix caught bare RuntimeError around the whole _create_agent()+
+        run_conversation() span in _run_agent(), which would mislabel an
+        unrelated RuntimeError (e.g. from run_conversation() itself) as a
+        provider auth failure. The fix instead converts a RuntimeError from
+        gateway.run._resolve_runtime_agent_kwargs() specifically -- the sole
+        raiser of RuntimeError(format_runtime_provider_error(...)) anywhere
+        in this call graph -- into _ProviderAuthResolutionError right where
+        it's called, inside _create_agent(). This is the boundary test:
+        confirms _create_agent() itself does this conversion, independent
+        of any caller's exception handling."""
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: (_ for _ in ()).throw(RuntimeError("No credentials found for provider 'nous'")),
+        )
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        with pytest.raises(_ProviderAuthResolutionError, match="No credentials found for provider 'nous'"):
+            adapter._create_agent(session_id="api-session")
 
 
 # ---------------------------------------------------------------------------
