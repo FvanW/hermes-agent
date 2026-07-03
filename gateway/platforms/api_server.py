@@ -1298,6 +1298,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if runtime_model:
             model = runtime_model
 
+        # Codex round-2 re-review of finding #4: _resolve_runtime_agent_kwargs()
+        # can itself return a "request_overrides" key (hermes_cli/runtime_provider.py
+        # _custom_provider_request_overrides, e.g. {"extra_body": {...}} for a
+        # custom_providers entry) that was previously forwarded into AIAgent
+        # via the **runtime_kwargs spread below with no collision. Fix 4 below
+        # adds an explicit request_overrides=request_overrides kwarg for
+        # fast-mode support, which would collide with this one
+        # ("got multiple values for keyword argument 'request_overrides'") --
+        # the exact same bug class as the original model= collision this whole
+        # branch started from. Pop it here and merge it with the fast-mode
+        # overrides later so neither source is silently dropped or crashes.
+        runtime_request_overrides = runtime_kwargs.pop("request_overrides", None) or {}
+
         # Per-client model routing (model_routes config).  The route was
         # resolved from the request's ``model`` field by the HTTP handler.
         # Precedence (highest first): session ``/model`` override → model_routes
@@ -1437,6 +1450,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 request_overrides = resolve_fast_mode_overrides(model) or {}
             except Exception:
                 request_overrides = {}
+        # Merge back the custom-provider overrides popped off runtime_kwargs
+        # above (see that comment). Distinct key namespaces in practice
+        # (fast-mode: "service_tier"/"speed"; custom-provider: "extra_body"),
+        # so runtime_request_overrides takes precedence as the more specific,
+        # connection-required setting on any future overlap.
+        if runtime_request_overrides:
+            request_overrides = {**request_overrides, **runtime_request_overrides}
 
         agent = AIAgent(
             model=model,
